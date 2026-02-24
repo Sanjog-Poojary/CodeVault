@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import Odometer from '@/components/Odometer';
 import Sparkline from '@/components/Sparkline';
@@ -25,10 +25,17 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const { setFinancials } = useFinancialStore();
 
+  // ── Race condition guard ─────────────────────────────────
+  // Each loadData call gets a unique ID. On Realtime bursts,
+  // only the LAST in-flight response commits state.
+  const requestIdRef = useRef(0);
+  const r2 = (n: number) => Math.round(n * 100) / 100;
+
   const loadData = useCallback(async () => {
+    const myId = ++requestIdRef.current; // snapshot before any await
     const supabase = createClient();
     const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return;
+    if (!user || myId !== requestIdRef.current) return;
 
     const { data: income } = await supabase
       .from('income_events')
@@ -49,10 +56,14 @@ export default function DashboardPage() {
       .order('created_at', { ascending: false })
       .limit(5);
 
-    const gross = (income || []).reduce((a: number, e: any) => a + Number(e.net_amount), 0);
-    const taxReserve = (income || []).reduce((a: number, e: any) => a + Number(e.tax_slice), 0);
-    const billsTotal = (bills || []).reduce((a: number, b: any) => a + Number(b.amount), 0);
-    const realBalance = gross - billsTotal;
+    // Stale check: another call fired while we were awaiting
+    if (myId !== requestIdRef.current) return;
+
+    // Float-safe aggregation
+    const gross      = r2((income || []).reduce((a: number, e: any) => a + Number(e.net_amount), 0));
+    const taxReserve = r2((income || []).reduce((a: number, e: any) => a + Number(e.tax_slice), 0));
+    const billsTotal = r2((bills  || []).reduce((a: number, b: any) => a + Number(b.amount), 0));
+    const realBalance = r2(gross - billsTotal);
 
     setSummary({ gross, taxReserve, bills: billsTotal, realBalance });
     setFinancials({ grossBalance: gross, taxReserve, committedBills: billsTotal, realBalance });
@@ -68,7 +79,7 @@ export default function DashboardPage() {
     for (let i = 29; i >= 0; i--) {
       const day = new Date(now - i * 86400000).toDateString();
       const dayEvents = sorted.filter((e) => new Date(e.created_at).toDateString() === day);
-      running += dayEvents.reduce((s: number, e: any) => s + Number(e.net_amount), 0);
+      running = r2(running + dayEvents.reduce((s: number, e: any) => s + Number(e.net_amount), 0));
       last30.push({ value: running });
     }
     setSparkData(last30);

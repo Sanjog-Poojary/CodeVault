@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { z } from 'zod';
 import { createClient } from '@/lib/supabase/client';
 import { calculateTaxSlice, calculateNetAmount } from '@/lib/tax';
 
@@ -9,6 +10,26 @@ interface Props {
   onSuccess: () => void;
 }
 
+// ── Validation schema ─────────────────────────────────────
+const IncomeEventSchema = z.object({
+  amount: z
+    .number({ message: 'Amount must be a number' })
+    .positive('Amount must be greater than zero')
+    .max(100_000_000, 'Amount exceeds maximum'),
+  eventDate: z.string().refine((d) => {
+    const date = new Date(d);
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    return date <= tomorrow;
+  }, 'Event date cannot be in the future'),
+  clientName: z.string().max(200).optional(),
+  description: z.string().max(500).optional(),
+  taxRate: z.number().min(0).max(60),
+});
+
+// Float-safe 2dp rounding — prevents JS binary float errors
+const r2 = (n: number) => Math.round(n * 100) / 100;
+
 export default function LogIncomeModal({ onClose, onSuccess }: Props) {
   const [amount, setAmount] = useState('');
   const [clientName, setClientName] = useState('');
@@ -16,44 +37,62 @@ export default function LogIncomeModal({ onClose, onSuccess }: Props) {
   const [eventDate, setEventDate] = useState(new Date().toISOString().split('T')[0]);
   const [taxOverride, setTaxOverride] = useState('');
   const [status, setStatus] = useState<'idle' | 'loading' | 'done'>('idle');
+  const [error, setError] = useState('');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError('');
+
+    // ── Client-side Zod validation ────────────────────────
+    const parsed = IncomeEventSchema.safeParse({
+      amount: Number(amount),
+      eventDate,
+      clientName: clientName || undefined,
+      description: description || undefined,
+      taxRate: taxOverride ? Number(taxOverride) : 30,
+    });
+
+    if (!parsed.success) {
+      setError(parsed.error.issues[0]?.message ?? 'Validation error');
+      return;
+    }
+
     setStatus('loading');
     const supabase = createClient();
     const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return;
+    if (!user) { setError('Not authenticated'); setStatus('idle'); return; }
 
-    // Get user tax rate
     const { data: userData } = await supabase.from('users').select('tax_rate').eq('id', user.id).single();
     const taxRate = taxOverride ? Number(taxOverride) : (userData?.tax_rate ?? 30);
 
-    const amountNum = Number(amount);
-    const taxSlice = calculateTaxSlice(amountNum, taxRate);
-    const netAmount = calculateNetAmount(amountNum, taxRate);
+    // Float-safe arithmetic — all values rounded to 2dp before DB insert
+    const amountNum = r2(Number(amount));
+    const taxSlice  = r2(calculateTaxSlice(amountNum, taxRate));
+    const netAmount = r2(amountNum - taxSlice);
 
-    const { error } = await supabase.from('income_events').insert({
+    const { error: dbError } = await supabase.from('income_events').insert({
       user_id: user.id,
       amount: amountNum,
       tax_slice: taxSlice,
       net_amount: netAmount,
-      client_name: clientName,
-      description,
+      client_name: clientName.trim() || null,
+      description: description.trim() || null,
       event_date: eventDate,
     });
 
-    if (!error) {
+    if (!dbError) {
       setStatus('done');
       setTimeout(onSuccess, 400);
     } else {
       setStatus('idle');
-      alert(error.message);
+      setError(dbError.message);
     }
   };
 
-  const amountNum = Number(amount) || 0;
-  const previewTax = amountNum > 0 ? calculateTaxSlice(amountNum, Number(taxOverride) || 30) : 0;
-  const previewNet = amountNum - previewTax;
+  const amountNum = r2(Number(amount) || 0);
+  const effectiveTaxRate = Number(taxOverride) || 30;
+  const previewTax = amountNum > 0 ? r2(calculateTaxSlice(amountNum, effectiveTaxRate)) : 0;
+  const previewNet = r2(amountNum - previewTax);
 
   return (
     <div
@@ -83,22 +122,22 @@ export default function LogIncomeModal({ onClose, onSuccess }: Props) {
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '16px' }}>
             <div>
               <label className="vf-label">Amount (₹)</label>
-              <input className="vf-input" type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="80000" required min="1" />
+              <input className="vf-input" type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="80000" required min="1" max="100000000" />
             </div>
             <div>
               <label className="vf-label">Date</label>
-              <input className="vf-input" type="date" value={eventDate} onChange={(e) => setEventDate(e.target.value)} required />
+              <input className="vf-input" type="date" value={eventDate} onChange={(e) => setEventDate(e.target.value)} required max={new Date().toISOString().split('T')[0]} />
             </div>
           </div>
 
           <div style={{ marginBottom: '16px' }}>
             <label className="vf-label">Client Name</label>
-            <input className="vf-input" type="text" value={clientName} onChange={(e) => setClientName(e.target.value)} placeholder="Acme Corp" />
+            <input className="vf-input" type="text" value={clientName} onChange={(e) => setClientName(e.target.value)} placeholder="Acme Corp" maxLength={200} />
           </div>
 
           <div style={{ marginBottom: '16px' }}>
             <label className="vf-label">Description</label>
-            <input className="vf-input" type="text" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Website redesign — Phase 1" />
+            <input className="vf-input" type="text" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Website redesign — Phase 1" maxLength={500} />
           </div>
 
           <div style={{ marginBottom: '24px' }}>
@@ -106,8 +145,19 @@ export default function LogIncomeModal({ onClose, onSuccess }: Props) {
             <input className="vf-input" type="number" value={taxOverride} onChange={(e) => setTaxOverride(e.target.value)} placeholder="30 (uses profile default)" min="0" max="60" />
           </div>
 
+          {/* Inline validation error — no alert() */}
+          {error && (
+            <div style={{
+              marginBottom: '16px', padding: '10px 12px', borderRadius: '6px',
+              fontSize: '12px', background: 'rgba(239,68,68,0.1)', color: '#EF4444',
+              border: '1px solid rgba(239,68,68,0.2)',
+            }}>
+              {error}
+            </div>
+          )}
+
           {/* Pipeline Preview */}
-          {amountNum > 0 && (
+          {amountNum > 0 && !error && (
             <div style={{
               background: '#0F1117', border: '1px solid #21262D', borderRadius: '8px',
               padding: '14px', marginBottom: '20px', fontSize: '12px',
